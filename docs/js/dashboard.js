@@ -7,8 +7,18 @@
      CONFIG
   ================================= */
   const API_BASE = "http://192.168.137.6:5000";
-  const ENDPOINT_LATEST = `${API_BASE}/get_attitude`; // expected: { pitch,yaw,roll,altitude,soil_status,timestamp? }
-  const REFRESH_INTERVAL = 500; // ms (lebih aman dari 100ms biar ga ngegas)
+  const ENDPOINT_SERIES = `${API_BASE}/telemetry`; // GET /telemetry?limit=N -> array
+  const ENDPOINT_LATEST = `${API_BASE}/telemetry?limit=1`;
+  const REFRESH_INTERVAL = 500; // ms
+
+  // Limit fetch biar nggak berat (backend kamu baca file lalu slice).
+  // Silakan naikkan kalau telemetry rate kamu rendah dan ingin history lebih panjang.
+  const RANGE_FETCH_LIMIT = {
+    "1h": 800,
+    "6h": 1500,
+    "24h": 2500,
+    "7d": 4000,
+  };
 
   /* ===============================
      DOM ELEMENTS
@@ -34,8 +44,9 @@
      STATE
   ================================= */
   let altitudeChart = null;
-  let points = []; // { t: Date, alt: number }
+  let points = []; // { t: string|number, alt: number }
   let timer = null;
+  let lastSeenTs = null; // string/number - used to avoid duplicate append
 
   /* ===============================
      HELPERS
@@ -57,18 +68,6 @@
     }
   }
 
-  function rangeToMaxPoints(range) {
-    // Ini “window” chart, bukan history 1 jam beneran (karena endpoint history belum pasti).
-    // Kalau backend kamu punya endpoint history, nanti kita bisa ganti jadi fetch series.
-    const map = {
-      "1h": 120,   // ~1 menit kalau refresh 500ms
-      "6h": 240,
-      "24h": 360,
-      "7d": 480,
-    };
-    return map[range] || 120;
-  }
-
   function updateTimeLabel(range) {
     const map = {
       "1h": "Last 1 hour",
@@ -77,6 +76,26 @@
       "7d": "Last 7 days",
     };
     if (timeFilterLabel) timeFilterLabel.textContent = map[range] || "Last 1 hour";
+  }
+
+  function rangeToDurationMs(range) {
+    const H = 60 * 60 * 1000;
+    const D = 24 * H;
+    const map = {
+      "1h": 1 * H,
+      "6h": 6 * H,
+      "24h": 24 * H,
+      "7d": 7 * D,
+    };
+    return map[range] || 1 * H;
+  }
+
+  function getActiveRange() {
+    return (timeFilter && timeFilter.value) ? timeFilter.value : "1h";
+  }
+
+  function getFetchLimitForRange(range) {
+    return RANGE_FETCH_LIMIT[range] || 800;
   }
 
   function setSoilStatus(value) {
@@ -108,7 +127,6 @@
     }
     const avg = sum / values.length;
 
-    // very simple “stability”: based on average absolute difference
     let diffSum = 0;
     for (let i = 1; i < values.length; i++) {
       diffSum += Math.abs(values[i] - values[i - 1]);
@@ -120,6 +138,53 @@
     else if (avgDiff > 1.2) stability = "Fair";
 
     return { peak, avg, stability };
+  }
+
+  function coerceNumber(v) {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : NaN;
+  }
+
+  function toTimeMs(ts) {
+    // ts bisa ISO string ("...Z") atau number
+    const t = new Date(ts).getTime();
+    return Number.isFinite(t) ? t : NaN;
+  }
+
+  /**
+   * backend record typical:
+   * { attitude:{roll,pitch,yaw}, position:{alt}, timestamp:"...Z", soil_status:"Suitable" }
+   */
+  function mapTelemetry(rec) {
+    const att = rec && typeof rec.attitude === "object" ? rec.attitude : {};
+    const pos = rec && typeof rec.position === "object" ? rec.position : {};
+
+    const pitch = coerceNumber(att.pitch);
+    const yaw = coerceNumber(att.yaw);
+    const roll = coerceNumber(att.roll);
+
+    const altitude = coerceNumber(pos.alt ?? rec.altitude);
+
+    const soil_status =
+      rec.soil_status ??
+      rec.soilStatus ??
+      (rec.soil && typeof rec.soil === "object" ? rec.soil.status : undefined);
+
+    const timestamp = rec.timestamp ?? Date.now();
+
+    return { pitch, yaw, roll, altitude, soil_status, timestamp };
+  }
+
+  function prunePointsByRange(range) {
+    const duration = rangeToDurationMs(range);
+    const cutoff = Date.now() - duration;
+
+    points = points.filter((p) => {
+      const ms = typeof p.t === "number" ? p.t : toTimeMs(p.t);
+      // kalau timestamp invalid, keep aja supaya chart tetap ada
+      if (!Number.isFinite(ms)) return true;
+      return ms >= cutoff;
+    });
   }
 
   /* ===============================
@@ -173,40 +238,99 @@
   }
 
   /* ===============================
-     FETCH + LOOP
+     FETCH
   ================================= */
-  async function fetchLatest() {
-    const res = await fetch(ENDPOINT_LATEST, { cache: "no-store" });
+  async function fetchJson(url) {
+    const res = await fetch(url, { cache: "no-store" });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return res.json();
   }
 
+  async function fetchSeries(limit) {
+    const url = `${ENDPOINT_SERIES}?limit=${encodeURIComponent(limit)}`;
+    const data = await fetchJson(url);
+    return Array.isArray(data) ? data : [];
+  }
+
+  async function fetchLatestRecord() {
+    const data = await fetchJson(ENDPOINT_LATEST);
+    if (Array.isArray(data)) return data.length ? data[data.length - 1] : null;
+    return data && typeof data === "object" ? data : null;
+  }
+
+  /* ===============================
+     HISTORY LOAD (REAL RANGE)
+  ================================= */
+  async function loadHistoryForRange(range) {
+    const limit = getFetchLimitForRange(range);
+    const duration = rangeToDurationMs(range);
+    const cutoff = Date.now() - duration;
+
+    const records = await fetchSeries(limit);
+
+    // Map + filter by time
+    const mapped = records
+      .map(mapTelemetry)
+      .filter((m) => {
+        const ms = typeof m.timestamp === "number" ? m.timestamp : toTimeMs(m.timestamp);
+        if (!Number.isFinite(ms)) return true; // keep if invalid
+        return ms >= cutoff;
+      })
+      .filter((m) => Number.isFinite(m.altitude));
+
+    // Build points
+    points = mapped.map((m) => ({ t: m.timestamp, alt: m.altitude }));
+
+    // Update latest UI from the last record in mapped list (or from raw last record)
+    const lastMapped = mapped.length ? mapped[mapped.length - 1] : null;
+    if (lastMapped) {
+      setOnline(true);
+      setOrientation({ pitch: lastMapped.pitch, yaw: lastMapped.yaw, roll: lastMapped.roll });
+      setSoilStatus(lastMapped.soil_status);
+      lastSeenTs = lastMapped.timestamp;
+    } else {
+      // no points within range; still set online if server reachable
+      setOnline(true);
+      lastSeenTs = null;
+    }
+
+    // prune (just in case) and render
+    prunePointsByRange(range);
+    renderChart();
+  }
+
+  /* ===============================
+     LOOP
+  ================================= */
   async function tick() {
+    const range = getActiveRange();
+
     try {
-      const data = await fetchLatest();
+      const rec = await fetchLatestRecord();
+      if (!rec) {
+        setOnline(false);
+        return;
+      }
 
       setOnline(true);
 
-      const pitch = Number(data.pitch);
-      const yaw = Number(data.yaw);
-      const roll = Number(data.roll);
-      setOrientation({
-        pitch: Number.isFinite(pitch) ? pitch : NaN,
-        yaw: Number.isFinite(yaw) ? yaw : NaN,
-        roll: Number.isFinite(roll) ? roll : NaN,
-      });
+      const m = mapTelemetry(rec);
 
-      setSoilStatus(data.soil_status);
+      // Update HUD (orientation + soil) always
+      setOrientation({ pitch: m.pitch, yaw: m.yaw, roll: m.roll });
+      setSoilStatus(m.soil_status);
 
-      const altitude = Number(data.altitude);
-      const ts = data.timestamp ? data.timestamp : Date.now();
+      // Append only if this is a NEW record (avoid duplicates)
+      const currentTs = m.timestamp ?? null;
+      const isNew = currentTs != null && String(currentTs) !== String(lastSeenTs);
 
-      if (Number.isFinite(altitude)) {
-        points.push({ t: ts, alt: altitude });
-
-        const maxPoints = rangeToMaxPoints(timeFilter ? timeFilter.value : "1h");
-        if (points.length > maxPoints) points = points.slice(points.length - maxPoints);
+      if (isNew && Number.isFinite(m.altitude)) {
+        points.push({ t: m.timestamp, alt: m.altitude });
+        lastSeenTs = currentTs;
       }
+
+      // Real range pruning (time-based)
+      prunePointsByRange(range);
 
       renderChart();
     } catch (err) {
@@ -215,22 +339,34 @@
     }
   }
 
-  function start() {
+  async function start() {
     initChart();
-    updateTimeLabel(timeFilter ? timeFilter.value : "1h");
 
-    if (timeFilter) {
-      timeFilter.addEventListener("change", () => {
-        updateTimeLabel(timeFilter.value);
-        // optional: reset chart window on range change
-        const maxPoints = rangeToMaxPoints(timeFilter.value);
-        if (points.length > maxPoints) points = points.slice(points.length - maxPoints);
-        renderChart();
-      });
+    const range = getActiveRange();
+    updateTimeLabel(range);
+
+    // initial: load real history for chosen range
+    try {
+      await loadHistoryForRange(range);
+    } catch (e) {
+      console.error("Initial history load failed:", e);
+      setOnline(false);
     }
 
-    // first tick now
-    tick();
+    if (timeFilter) {
+      timeFilter.addEventListener("change", async () => {
+        const r = timeFilter.value;
+        updateTimeLabel(r);
+
+        // Reload real history when range changes
+        try {
+          await loadHistoryForRange(r);
+        } catch (e) {
+          console.error("History reload failed:", e);
+          // keep old chart, just mark offline if needed
+        }
+      });
+    }
 
     // loop
     if (timer) clearInterval(timer);
@@ -238,7 +374,7 @@
   }
 
   if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", start);
+    document.addEventListener("DOMContentLoaded", () => start());
   } else {
     start();
   }
