@@ -30,7 +30,7 @@ def post_telemetry():
 # =====================================
 # GET → read telemetry
 # =====================================
-@app.route("/get_telemetry", methods=["GET"])
+@app.route("/telemetry", methods=["GET"])
 def get_telemetry():
     if not os.path.exists(LOG_FILE):
         return jsonify([]), 200

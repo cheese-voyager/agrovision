@@ -6,7 +6,7 @@
   /* ===============================
      CONFIG
   ================================= */
-  const API_BASE = "http://192.168.87.43:5000";
+  const API_BASE = "http://192.168.249.197:5000";
   const ENDPOINT_SERIES = `${API_BASE}/telemetry`; // GET /telemetry?limit=N -> array
   const ENDPOINT_LATEST = `${API_BASE}/telemetry?limit=1`;
   const REFRESH_INTERVAL = 500; // ms
